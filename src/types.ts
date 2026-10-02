@@ -49,11 +49,33 @@ export type AggregateSpec =
   | { func: 'count'; column: string; as: string }
   | { func: 'sum'; column: string; as: string };
 
+/**
+ * 连接类型：
+ * - inner（默认）：内连接，无匹配的左行不输出
+ * - leftOuter：左外连接；无真实匹配的左行恰好输出一次右侧 NULL 扩展行
+ */
+export type JoinType = 'inner' | 'leftOuter';
+
 /** 结构化查询计划节点 */
 export type PlanNode =
   | { op: 'scan'; table: string; alias?: string }
   | { op: 'filter'; input: PlanNode; predicate: Predicate }
-  | { op: 'join'; left: PlanNode; right: PlanNode; leftColumn: string; rightColumn: string }
+  | {
+      op: 'join';
+      left: PlanNode;
+      right: PlanNode;
+      leftColumn: string;
+      rightColumn: string;
+      /** 缺省为 inner */
+      joinType?: JoinType;
+      /**
+       * 可选的额外连接谓词，在连接后的行上求值；只有 TRUE 才算真实匹配。
+       * 等值键始终是必需条件，NULL 键不连接。leftOuter 下 FALSE/UNKNOWN
+       * 的候选不产出匹配行，左行改由 NULL 扩展行补出。
+       * 必须与连接外层的 filter 分阶段执行，不能把外层 filter 下推到连接内。
+       */
+      on?: Predicate;
+    }
   | { op: 'project'; input: PlanNode; columns: { name: string; as?: string }[] }
   | { op: 'aggregate'; input: PlanNode; groupBy: string[]; aggregates: AggregateSpec[] };
 

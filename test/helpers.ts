@@ -8,6 +8,7 @@ import type {
   ColumnDef,
   ColumnType,
   InputTable,
+  JoinType,
   Operand,
   PlanNode,
   Predicate,
@@ -60,7 +61,16 @@ export const join = (
   right: PlanNode,
   leftColumn: string,
   rightColumn: string,
-): PlanNode => ({ op: 'join', left, right, leftColumn, rightColumn });
+  options?: { joinType?: JoinType; on?: Predicate },
+): PlanNode => ({
+  op: 'join',
+  left,
+  right,
+  leftColumn,
+  rightColumn,
+  ...(options?.joinType !== undefined ? { joinType: options.joinType } : {}),
+  ...(options?.on !== undefined ? { on: options.on } : {}),
+});
 export const project = (input: PlanNode, columns: (string | { name: string; as: string })[]): PlanNode => ({
   op: 'project',
   input,
@@ -99,11 +109,14 @@ export interface RefRow {
 
 export interface RefRelation {
   columns: ColumnDef[];
+  /** 来源关系名（表名或别名）；用于连接后同名列的限定名推导 */
+  relation?: string;
   rows: RefRow[];
 }
 
-export function refScan(t: InputTable): RefRelation {
+export function refScan(t: InputTable, relation?: string): RefRelation {
   return {
+    relation,
     columns: t.columns.map((c) => ({ ...c })),
     rows: t.rows.map((r) => ({ values: [...r.values], sourceIds: [r.id] })),
   };
@@ -202,6 +215,7 @@ export function refEvalPredicate(
 /** 参考筛选：只保留 TRUE */
 export function refFilter(rel: RefRelation, pred: Predicate): RefRelation {
   return {
+    relation: rel.relation,
     columns: rel.columns,
     rows: rel.rows.filter((r) => refEvalPredicate(pred, r.values, rel.columns) === 'T'),
   };
@@ -211,14 +225,37 @@ export function refFilter(rel: RefRelation, pred: Predicate): RefRelation {
 // 参考连接：哈希索引实现（引擎是嵌套循环），输出顺序仍为左行优先
 // ---------------------------------------------------------------------------
 
+/** 参考连接输出列：同名冲突列在两侧都限定为 关系名.列名（与 schema.ts 同一规则） */
+export function refJoinColumns(left: RefRelation, right: RefRelation): ColumnDef[] {
+  const leftNames = new Set(left.columns.map((c) => c.name));
+  const rightNames = new Set(right.columns.map((c) => c.name));
+  return [
+    ...left.columns.map((c) => ({
+      name: rightNames.has(c.name) ? `${left.relation}.${c.name}` : c.name,
+      type: c.type,
+    })),
+    ...right.columns.map((c) => ({
+      name: leftNames.has(c.name) ? `${right.relation}.${c.name}` : c.name,
+      type: c.type,
+    })),
+  ];
+}
+
+/**
+ * 参考等值连接：右表按非 NULL 键建哈希桶，左行线性探测（与引擎的嵌套循环独立）。
+ * 额外 on 谓词在连接后的行上按真值表求值，只有 TRUE 才算真实匹配。
+ * 传入的 RefRelation 需带 relation 名（refScanWith），用于限定名列推导。
+ */
 export function refJoin(
   left: RefRelation,
   right: RefRelation,
   leftCol: string,
   rightCol: string,
+  on?: Predicate,
 ): RefRelation {
   const li = left.columns.findIndex((c) => c.name === leftCol);
   const ri = right.columns.findIndex((c) => c.name === rightCol);
+  const columns = refJoinColumns(left, right);
   const index = new Map<Scalar, RefRow[]>();
   for (const r of right.rows) {
     const key = r.values[ri]!;
@@ -232,14 +269,64 @@ export function refJoin(
     const key = l.values[li]!;
     if (key === null) continue;
     for (const r of index.get(key) ?? []) {
+      const values = [...l.values, ...r.values];
+      if (on !== undefined && refEvalPredicate(on, values, columns) !== 'T') continue;
       rows.push({
-        values: [...l.values, ...r.values],
+        values,
         sourceIds: dedup([...l.sourceIds, ...r.sourceIds]),
       });
     }
   }
-  // 测试生成的表列名互不重叠，因此无需限定名
-  return { columns: [...left.columns, ...right.columns], rows };
+  return { columns, rows };
+}
+
+/**
+ * 参考左外连接：每个左行先做等值 + on 匹配；没有任何真实匹配时
+ * （右表无候选、键为 NULL、或所有候选 on 为 FALSE/UNKNOWN）
+ * 恰好补一次右侧 NULL 扩展行，来源证据只含左侧行 ID。
+ */
+export function refLeftJoin(
+  left: RefRelation,
+  right: RefRelation,
+  leftCol: string,
+  rightCol: string,
+  on?: Predicate,
+): RefRelation {
+  const li = left.columns.findIndex((c) => c.name === leftCol);
+  const ri = right.columns.findIndex((c) => c.name === rightCol);
+  const columns = refJoinColumns(left, right);
+  const index = new Map<Scalar, RefRow[]>();
+  for (const r of right.rows) {
+    const key = r.values[ri]!;
+    if (key === null) continue;
+    const bucket = index.get(key);
+    if (bucket === undefined) index.set(key, [r]);
+    else bucket.push(r);
+  }
+  const nulls = right.columns.map(() => null);
+  const rows: RefRow[] = [];
+  for (const l of left.rows) {
+    const key = l.values[li]!;
+    let matched = 0;
+    if (key !== null) {
+      for (const r of index.get(key) ?? []) {
+        const values = [...l.values, ...r.values];
+        if (on !== undefined && refEvalPredicate(on, values, columns) !== 'T') continue;
+        rows.push({
+          values,
+          sourceIds: dedup([...l.sourceIds, ...r.sourceIds]),
+        });
+        matched += 1;
+      }
+    }
+    if (matched === 0) {
+      rows.push({
+        values: [...l.values, ...nulls],
+        sourceIds: dedup([...l.sourceIds]),
+      });
+    }
+  }
+  return { columns, rows };
 }
 
 // ---------------------------------------------------------------------------
@@ -294,12 +381,13 @@ export function refAggregate(
     })),
     ...aggregates.map((agg) => ({ name: agg.as, type: 'number' as ColumnType })),
   ];
-  return { columns, rows };
+  return { relation: undefined, columns, rows };
 }
 
 export function refProject(rel: RefRelation, cols: string[]): RefRelation {
   const idx = cols.map((name) => rel.columns.findIndex((c) => c.name === name));
   return {
+    relation: rel.relation,
     columns: cols.map((name) => rel.columns.find((c) => c.name === name)!),
     rows: rel.rows.map((r) => ({
       values: idx.map((i) => r.values[i]!),

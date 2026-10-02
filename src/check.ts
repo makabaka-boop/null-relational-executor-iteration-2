@@ -74,7 +74,13 @@ export function checkPlan(
             .join(', ')} exist on both join inputs and cannot be qualified; give the scans distinct aliases`,
         );
       }
-      return joinSchemas(left, right);
+      const schema = joinSchemas(left, right);
+      // 额外 on 谓词在“连接后的行”上求值：列名与类型按连接输出模式检查。
+      // 任何非法列引用或谓词类型都导致整次请求拒绝。
+      if (node.on !== undefined) {
+        checkPredicate(node.on, schema, errors, `${path}.on`);
+      }
+      return schema;
     }
     case 'project': {
       const schema = checkPlan(node.input, tables, errors, `${path}.input`);

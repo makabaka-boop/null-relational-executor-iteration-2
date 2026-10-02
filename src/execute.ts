@@ -69,23 +69,42 @@ export function executePlan(node: PlanNode, tables: Map<string, InputTable>): Re
       const right = executePlan(node.right, tables);
       const li = columnIndex(left.schema, node.leftColumn);
       const ri = columnIndex(right.schema, node.rightColumn);
+      const schema = joinSchemas(left.schema, right.schema);
+      const leftOuter = node.joinType === 'leftOuter';
+      const nulls = right.schema.columns.map(() => null);
       const rows: InternalRow[] = [];
-      // 嵌套循环等值连接，左行优先的顺序；NULL 与任何值都不相等，不能连接
+      // 嵌套循环等值连接，左行优先的顺序；NULL 与任何值都不相等，不能连接。
+      // on 在连接后的行上逐候选求值（TRUE 才算匹配），与连接外层 filter 分阶段：
+      // 外层 filter 绝不下推到此处，否则会错误吞掉补空行。
       for (const l of left.rows) {
         const lv = l.values[li]!;
-        if (lv === null) continue;
-        for (const r of right.rows) {
-          const rv = r.values[ri]!;
-          if (rv === null) continue;
-          if (lv === rv) {
-            rows.push({
+        let matched = 0;
+        if (lv !== null) {
+          for (const r of right.rows) {
+            const rv = r.values[ri]!;
+            if (rv === null || lv !== rv) continue;
+            const candidate: InternalRow = {
               values: [...l.values, ...r.values],
               provenance: dedupIds([...l.provenance, ...r.provenance]),
-            });
+            };
+            // 等值键是必需条件；额外 on 仅在为 TRUE 时接受候选
+            if (node.on !== undefined && evalPredicate(node.on, candidate, schema) !== 'T') {
+              continue;
+            }
+            rows.push(candidate);
+            matched += 1;
           }
         }
+        // 左外连接：右表无匹配，或所有候选 on 均为 FALSE/UNKNOWN（含 NULL 键）时，
+        // 左行恰好输出一次右侧 NULL 扩展行，来源证据只含左侧行 ID。
+        if (leftOuter && matched === 0) {
+          rows.push({
+            values: [...l.values, ...nulls],
+            provenance: [...l.provenance],
+          });
+        }
       }
-      return { schema: joinSchemas(left.schema, right.schema), rows };
+      return { schema, rows };
     }
     case 'project': {
       const input = executePlan(node.input, tables);

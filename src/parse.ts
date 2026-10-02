@@ -10,6 +10,7 @@ import type {
   ComparisonOp,
   InputRow,
   InputTable,
+  JoinType,
   Operand,
   PlanNode,
   Predicate,
@@ -24,6 +25,7 @@ export interface ParsedRequest {
 
 const COMPARISON_OPS = new Set<ComparisonOp>(['=', '!=', '<', '<=', '>', '>=']);
 const COLUMN_TYPES = new Set<ColumnType>(['number', 'string', 'boolean']);
+const JOIN_TYPES = new Set<JoinType>(['inner', 'leftOuter']);
 
 function isObject(x: unknown): x is Record<string, unknown> {
   return typeof x === 'object' && x !== null && !Array.isArray(x);
@@ -271,13 +273,35 @@ export function parsePlan(raw: unknown, errors: string[], path: string): PlanNod
       const rightOk = isRefName(raw.rightColumn);
       if (!leftOk) errors.push(`${path}.leftColumn: must be a non-empty string`);
       if (!rightOk) errors.push(`${path}.rightColumn: must be a non-empty string`);
-      if (left === null || right === null || !leftOk || !rightOk) return null;
+      // joinType 缺省即 inner；非法枚举整体拒绝
+      let joinType: JoinType | undefined;
+      let joinTypeOk = true;
+      if (raw.joinType !== undefined) {
+        if (typeof raw.joinType === 'string' && JOIN_TYPES.has(raw.joinType as JoinType)) {
+          joinType = raw.joinType as JoinType;
+        } else {
+          errors.push(`${path}.joinType: must be 'inner' or 'leftOuter'`);
+          joinTypeOk = false;
+        }
+      }
+      // 可选的额外 on 谓词；缺省/undefined 表示无（保持旧计划形状）
+      let on: Predicate | null = null;
+      let onOk = true;
+      if (raw.on !== undefined) {
+        on = parsePredicate(raw.on, errors, `${path}.on`);
+        if (on === null) onOk = false;
+      }
+      if (left === null || right === null || !leftOk || !rightOk || !joinTypeOk || !onOk) {
+        return null;
+      }
       return {
         op: 'join',
         left,
         right,
         leftColumn: raw.leftColumn as string,
         rightColumn: raw.rightColumn as string,
+        ...(joinType !== undefined ? { joinType } : {}),
+        ...(on !== null ? { on } : {}),
       };
     }
     case 'project': {
