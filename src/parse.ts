@@ -271,13 +271,42 @@ export function parsePlan(raw: unknown, errors: string[], path: string): PlanNod
       const rightOk = isRefName(raw.rightColumn);
       if (!leftOk) errors.push(`${path}.leftColumn: must be a non-empty string`);
       if (!rightOk) errors.push(`${path}.rightColumn: must be a non-empty string`);
-      if (left === null || right === null || !leftOk || !rightOk) return null;
+      // joinType 缺省为 inner；只允许枚举值
+      let joinType: 'inner' | 'left' = 'inner';
+      let joinTypeOk = true;
+      if (raw.joinType !== undefined) {
+        if (raw.joinType !== 'inner' && raw.joinType !== 'left') {
+          errors.push(`${path}.joinType: must be 'inner' or 'left'`);
+          joinTypeOk = false;
+        } else {
+          joinType = raw.joinType;
+        }
+      }
+      // 可选的额外 ON 谓词（结构与 filter 谓词相同）
+      let on: Predicate | undefined;
+      let onOk = true;
+      if (raw.on !== undefined) {
+        on = parsePredicate(raw.on, errors, `${path}.on`) ?? undefined;
+        if (on === undefined) onOk = false;
+      }
+      if (
+        left === null ||
+        right === null ||
+        !leftOk ||
+        !rightOk ||
+        !joinTypeOk ||
+        !onOk
+      ) {
+        return null;
+      }
       return {
         op: 'join',
         left,
         right,
         leftColumn: raw.leftColumn as string,
         rightColumn: raw.rightColumn as string,
+        ...(raw.joinType !== undefined ? { joinType } : {}),
+        ...(raw.on !== undefined ? { on } : {}),
       };
     }
     case 'project': {

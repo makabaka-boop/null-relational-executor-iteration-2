@@ -47,6 +47,7 @@ export const orP = (...args: Predicate[]): Predicate => ({ kind: 'or', args });
 export const notP = (arg: Predicate): Predicate => ({ kind: 'not', arg });
 export const isNullP = (operand: Operand): Predicate => ({ kind: 'isNull', operand });
 export const isNotNullP = (operand: Operand): Predicate => ({ kind: 'isNotNull', operand });
+export const constantP = (value: boolean): Predicate => ({ kind: 'constant', value });
 
 export const scan = (table: string, alias?: string): PlanNode =>
   alias === undefined ? { op: 'scan', table } : { op: 'scan', table, alias };
@@ -61,6 +62,30 @@ export const join = (
   leftColumn: string,
   rightColumn: string,
 ): PlanNode => ({ op: 'join', left, right, leftColumn, rightColumn });
+/** 内连接 + 额外 on 谓词（等值键仍是必需条件） */
+export const joinOn = (
+  left: PlanNode,
+  right: PlanNode,
+  leftColumn: string,
+  rightColumn: string,
+  on: Predicate,
+): PlanNode => ({ op: 'join', left, right, leftColumn, rightColumn, on });
+/** 左外连接 + 可选额外 on 谓词 */
+export const leftJoin = (
+  left: PlanNode,
+  right: PlanNode,
+  leftColumn: string,
+  rightColumn: string,
+  on?: Predicate,
+): PlanNode => ({
+  op: 'join',
+  left,
+  right,
+  leftColumn,
+  rightColumn,
+  joinType: 'left',
+  ...(on !== undefined ? { on } : {}),
+});
 export const project = (input: PlanNode, columns: (string | { name: string; as: string })[]): PlanNode => ({
   op: 'project',
   input,
@@ -100,12 +125,15 @@ export interface RefRow {
 export interface RefRelation {
   columns: ColumnDef[];
   rows: RefRow[];
+  /** 来源关系名（scan 的表名或别名）；连接/聚合后为 undefined */
+  relation?: string;
 }
 
-export function refScan(t: InputTable): RefRelation {
+export function refScan(t: InputTable, alias?: string): RefRelation {
   return {
     columns: t.columns.map((c) => ({ ...c })),
     rows: t.rows.map((r) => ({ values: [...r.values], sourceIds: [r.id] })),
+    relation: alias ?? t.name,
   };
 }
 
@@ -202,44 +230,96 @@ export function refEvalPredicate(
 /** 参考筛选：只保留 TRUE */
 export function refFilter(rel: RefRelation, pred: Predicate): RefRelation {
   return {
+    relation: rel.relation,
     columns: rel.columns,
     rows: rel.rows.filter((r) => refEvalPredicate(pred, r.values, rel.columns) === 'T'),
   };
 }
 
 // ---------------------------------------------------------------------------
-// 参考连接：哈希索引实现（引擎是嵌套循环），输出顺序仍为左行优先
+// 参考连接：哈希索引实现（引擎是嵌套循环），输出顺序仍为左行优先。
+// 支持 inner/left 与连接内部的额外 on 谓词；限定名规则与引擎各自独立实现。
 // ---------------------------------------------------------------------------
+
+export interface RefJoinOptions {
+  joinType?: 'inner' | 'left';
+  on?: Predicate;
+  /** 两侧关系名（表名或别名），用于重名列限定；测试表无重名时可省略 */
+  leftRelation?: string;
+  rightRelation?: string;
+}
+
+/** 参考限定名规则（独立于 src/schema.ts 再实现一遍）：同名冲突在两侧都限定 */
+function refJoinedColumns(
+  left: RefRelation,
+  right: RefRelation,
+  lr: string | undefined,
+  rr: string | undefined,
+): ColumnDef[] {
+  const leftNames = new Set(left.columns.map((c) => c.name));
+  const rightNames = new Set(right.columns.map((c) => c.name));
+  return [
+    ...left.columns.map((c) => ({
+      name: rightNames.has(c.name) ? `${lr}.${c.name}` : c.name,
+      type: c.type,
+    })),
+    ...right.columns.map((c) => ({
+      name: leftNames.has(c.name) ? `${rr}.${c.name}` : c.name,
+      type: c.type,
+    })),
+  ];
+}
 
 export function refJoin(
   left: RefRelation,
   right: RefRelation,
   leftCol: string,
   rightCol: string,
+  opts?: RefJoinOptions,
 ): RefRelation {
   const li = left.columns.findIndex((c) => c.name === leftCol);
   const ri = right.columns.findIndex((c) => c.name === rightCol);
+  const columns = refJoinedColumns(
+    left,
+    right,
+    opts?.leftRelation ?? left.relation,
+    opts?.rightRelation ?? right.relation,
+  );
   const index = new Map<Scalar, RefRow[]>();
   for (const r of right.rows) {
     const key = r.values[ri]!;
-    if (key === null) continue; // NULL 不能连接
+    if (key === null) continue; // NULL 不能连接（等值键是必需条件）
     const bucket = index.get(key);
     if (bucket === undefined) index.set(key, [r]);
     else bucket.push(r);
   }
+  const nullRight: Scalar[] = right.columns.map(() => null);
+  const isLeft = opts?.joinType === 'left';
   const rows: RefRow[] = [];
   for (const l of left.rows) {
     const key = l.values[li]!;
-    if (key === null) continue;
-    for (const r of index.get(key) ?? []) {
-      rows.push({
-        values: [...l.values, ...r.values],
-        sourceIds: dedup([...l.sourceIds, ...r.sourceIds]),
-      });
+    let matched = false;
+    if (key !== null) {
+      for (const r of index.get(key) ?? []) {
+        const values = [...l.values, ...r.values];
+        // 额外 on 谓词在连接内部、合并后的模式上按三值逻辑求值：仅 TRUE 匹配；
+        // FALSE/UNKNOWN 不是匹配（左外连接时由补空行保留左行）
+        if (
+          opts?.on !== undefined &&
+          refEvalPredicate(opts.on, values, columns) !== 'T'
+        ) {
+          continue;
+        }
+        rows.push({ values, sourceIds: dedup([...l.sourceIds, ...r.sourceIds]) });
+        matched = true;
+      }
+    }
+    if (isLeft && !matched) {
+      // 右侧 NULL 扩展：左行恰好一次，来源证据只含左侧行 ID
+      rows.push({ values: [...l.values, ...nullRight], sourceIds: dedup([...l.sourceIds]) });
     }
   }
-  // 测试生成的表列名互不重叠，因此无需限定名
-  return { columns: [...left.columns, ...right.columns], rows };
+  return { columns, rows };
 }
 
 // ---------------------------------------------------------------------------
@@ -300,6 +380,7 @@ export function refAggregate(
 export function refProject(rel: RefRelation, cols: string[]): RefRelation {
   const idx = cols.map((name) => rel.columns.findIndex((c) => c.name === name));
   return {
+    relation: rel.relation,
     columns: cols.map((name) => rel.columns.find((c) => c.name === name)!),
     rows: rel.rows.map((r) => ({
       values: idx.map((i) => r.values[i]!),
