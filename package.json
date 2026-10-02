@@ -1,0 +1,16 @@
+{
+  "name": "structured-query-engine",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Executes structured query plans (scan/filter/join/project/aggregate) over typed tables with three-valued logic and row provenance",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "tsc -p tsconfig.json && node --test dist/test/",
+    "start": "node dist/src/server.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.4.0"
+  }
+}
